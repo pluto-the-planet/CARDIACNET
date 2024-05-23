@@ -46,119 +46,115 @@ labels_val=labels_val.reshape((1076, 256, 256, 1))
 
 import tensorflow as tf
 from tensorflow.keras import backend as K
-​
+
 def dice_coef(y_true, y_pred, smooth=1):
     y_true = K.cast(y_true, 'float32')
     y_pred = K.cast(y_pred, 'float32')
-
+    
     y_true_f = K.flatten(y_true)
     y_pred_f = K.flatten(y_pred)
-
+    
     intersection = K.sum(y_true_f * y_pred_f)
     union = K.sum(y_true_f) + K.sum(y_pred_f)
-
+    
     dice = (2. * intersection + smooth) / (union + smooth)
     return dice
-​
-​
+
+
 def iou_coef(y_true, y_pred, smooth=1):
     y_true = K.cast(y_true, 'float32')
     y_pred = K.cast(y_pred, 'float32')
-
+    
     y_true_f = K.flatten(y_true)
     y_pred_f = K.flatten(y_pred)
-
+    
     intersection = K.sum(y_true_f * y_pred_f)
     total = K.sum(y_true_f) + K.sum(y_pred_f)
     union = total - intersection
-
+    
     iou = (intersection + smooth) / (union + smooth)
     return iou
 
+def dice_loss(y_true, y_pred):
+    return 1 - dice_coef(y_true, y_pred)
+
+def matthews_correlation_coefficient(y_true, y_pred):
+    y_true = K.cast(y_true, 'float32')
+    y_pred = K.cast(y_pred, 'float32')
+    tp = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
+    tn = K.sum(K.round(K.clip((1 - y_true) * (1 - y_pred), 0, 1)))
+    fp = K.sum(K.round(K.clip((1 - y_true) * y_pred, 0, 1)))
+    fn = K.sum(K.round(K.clip(y_true * (1 - y_pred), 0, 1)))
+
+    num = tp * tn - fp * fn
+    den = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    return num / K.sqrt(den + K.epsilon())
+
 import tensorflow as tf
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate, Activation, Add, Multiply, BatchNormalization
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate, Activation, Multiply, Add, BatchNormalization, Lambda
 
-def attention_gate(x, g, inter_shape):
-    theta_x = Conv2D(inter_shape, (2, 2), strides=(2, 2), padding='same')(x)
-    phi_g = Conv2D(inter_shape, (1, 1), padding='same')(g)
+def conv_block(input_tensor, num_filters):
+    x = Conv2D(num_filters, (3, 3), padding="same")(input_tensor)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = Conv2D(num_filters, (3, 3), padding="same")(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    return x
 
-    # Ensure the shapes match for addition
-    theta_x = UpSampling2D(size=(2, 2))(theta_x)
+def attention_gate(input_tensor, gating_tensor, num_filters):
+    gate_shape = gating_tensor.shape
+    x = Conv2D(num_filters, (1, 1), padding='same')(input_tensor)
+    g = Conv2D(num_filters, (1, 1), padding='same')(gating_tensor)
+    x = UpSampling2D(size=(gate_shape[1] // x.shape[1], gate_shape[2] // x.shape[2]))(x)
+    x = Add()([x, g])
+    x = Activation('relu')(x)
+    x = Conv2D(1, (1, 1), padding='same')(x)
+    x = Activation('sigmoid')(x)
+    return Multiply()([input_tensor, x])
 
-    add_xg = Add()([theta_x, phi_g])
-    act_xg = Activation('relu')(add_xg)
-    psi = Conv2D(1, (1, 1), padding='same')(act_xg)
-    sigmoid_xg = Activation('sigmoid')(psi)
+def build_attention_unet(input_shape=(256, 256, 1)):
+    inputs = Input(input_shape)
 
-    # Resize psi to match the shape of the original input x
-    upsample_psi = Lambda(lambda x: tf.image.resize(x, tf.shape(x)[1:3]))(sigmoid_xg)
+    # Encoder
+    x0_0 = conv_block(inputs, 32)
+    p0 = MaxPooling2D((2, 2))(x0_0)
+    x1_0 = conv_block(p0, 64)
+    p1 = MaxPooling2D((2, 2))(x1_0)
+    x2_0 = conv_block(p1, 128)
+    p2 = MaxPooling2D((2, 2))(x2_0)
+    x3_0 = conv_block(p2, 256)
+    p3 = MaxPooling2D((2, 2))(x3_0)
+    x4_0 = conv_block(p3, 512)
 
-    y = Multiply()([x, upsample_psi])
-    result = Conv2D(inter_shape, (1, 1), padding='same')(y)
-    result_bn = BatchNormalization()(result)
-    return result_bn
+    # Intermediate Levels
+    x0_1 = conv_block(UpSampling2D()(x1_0), 32)
+    x1_1 = conv_block(UpSampling2D()(x2_0), 64)
+    x2_1 = conv_block(UpSampling2D()(x3_0), 128)
+    x3_1 = conv_block(UpSampling2D()(x4_0), 256)
 
-def Attention_UNetPP(input_size=(256, 256, 1)):
-    inputs = Input(input_size)
+    x0_2 = conv_block(concatenate([x0_0, attention_gate(x0_1, x0_0, 32)]), 32)
+    x1_2 = conv_block(concatenate([x1_0, attention_gate(x1_1, x1_0, 64)]), 64)
+    x2_2 = conv_block(concatenate([x2_0, attention_gate(x2_1, x2_0, 128)]), 128)
 
-    # Down-sampling path
-    conv1 = Conv2D(64, (3, 3), activation='relu', padding='same')(inputs)
-    conv1 = Conv2D(64, (3, 3), activation='relu', padding='same')(conv1)
-    pool1 = MaxPooling2D(pool_size=(2, 2))(conv1)
+    x0_3 = conv_block(concatenate([x0_0, x0_1, attention_gate(x0_2, x0_0, 32)]), 32)
+    x1_3 = conv_block(concatenate([x1_0, x1_1, attention_gate(x1_2, x1_0, 64)]), 64)
 
-    conv2 = Conv2D(128, (3, 3), activation='relu', padding='same')(pool1)
-    conv2 = Conv2D(128, (3, 3), activation='relu', padding='same')(conv2)
-    pool2 = MaxPooling2D(pool_size=(2, 2))(conv2)
+    x0_4 = conv_block(concatenate([x0_0, x0_1, x0_2, attention_gate(x0_3, x0_0, 32)]), 32)
 
-    conv3 = Conv2D(256, (3, 3), activation='relu', padding='same')(pool2)
-    conv3 = Conv2D(256, (3, 3), activation='relu', padding='same')(conv3)
-    pool3 = MaxPooling2D(pool_size=(2, 2))(conv3)
+    # Final output
+    outputs = Conv2D(1, (1, 1), activation='sigmoid')(x0_4)
 
-    conv4 = Conv2D(512, (3, 3), activation='relu', padding='same')(pool3)
-    conv4 = Conv2D(512, (3, 3), activation='relu', padding='same')(conv4)
-    pool4 = MaxPooling2D(pool_size=(2, 2))(conv4)
-
-    conv5 = Conv2D(1024, (3, 3), activation='relu', padding='same')(pool4)
-    conv5 = Conv2D(1024, (3, 3), activation='relu', padding='same')(conv5)
-
-    # Up-sampling path
-    up6 = UpSampling2D(size=(2, 2))(conv5)
-    att6 = attention_gate(conv4, up6, 512)
-    merge6 = concatenate([conv4, att6], axis=3)
-    conv6 = Conv2D(512, (3, 3), activation='relu', padding='same')(merge6)
-    conv6 = Conv2D(512, (3, 3), activation='relu', padding='same')(conv6)
-
-    up7 = UpSampling2D(size=(2, 2))(conv6)
-    att7 = attention_gate(conv3, up7, 256)
-    merge7 = concatenate([conv3, att7], axis=3)
-    conv7 = Conv2D(256, (3, 3), activation='relu', padding='same')(merge7)
-    conv7 = Conv2D(256, (3, 3), activation='relu', padding='same')(conv7)
-
-    up8 = UpSampling2D(size=(2, 2))(conv7)
-    att8 = attention_gate(conv2, up8, 128)
-    merge8 = concatenate([conv2, att8], axis=3)
-    conv8 = Conv2D(128, (3, 3), activation='relu', padding='same')(merge8)
-    conv8 = Conv2D(128, (3, 3), activation='relu', padding='same')(conv8)
-
-    up9 = UpSampling2D(size=(2, 2))(conv8)
-    att9 = attention_gate(conv1, up9, 64)
-    merge9 = concatenate([conv1, att9], axis=3)
-    conv9 = Conv2D(64, (3, 3), activation='relu', padding='same')(merge9)
-    conv9 = Conv2D(64, (3, 3), activation='relu', padding='same')(conv9)
-
-    conv10 = Conv2D(1, (1, 1), activation='sigmoid')(conv9)
-
-    model = Model(inputs, conv10)
-
+    model = Model(inputs=[inputs], outputs=[outputs])
     return model
 
-model = Attention_UNetPP(input_size=(256, 256, 1))
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy',dice_coef, iou_coef])
 
+model = build_attention_unet()
+model.compile(optimizer='adam', loss=dice_loss, metrics=['accuracy',dice_coef,iou_coef,matthews_correlation_coefficient])
 model.summary()
 
-history=model.fit(images, labels, epochs=25, batch_size=32, validation_data=(images_val,labels_val))
+history=model.fit(images, labels, epochs=60, batch_size=32, validation_data=(images_val,labels_val))
 # Save the model weights
 model.save_weights('model_weights.weights.h5')
 
