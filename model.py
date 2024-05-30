@@ -95,7 +95,9 @@ from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, c
 from tensorflow.keras.models import Model
 
 def conv_block(input_tensor, num_filters):
-    x = Conv2D(num_filters, (3, 3), padding="same")(input_tensor)
+    #x = Conv2D(num_filters, (3, 3), padding="same", kernel_regularizer=regularizers.l2())(input_tensor)
+    x = Conv2D(num_filters, (3, 3), padding="same",kernel_initializer="he_normal")(input_tensor)
+    x = Dropout(0.5)(x)
     x = BatchNormalization()(x)
     x = Activation("relu")(x)
     x = Conv2D(num_filters, (3, 3), padding="same")(x)
@@ -129,19 +131,22 @@ def build_attention_unet(input_shape=(256, 256, 1)):
     x4_0 = conv_block(p3, 512)
 
     # Intermediate Levels
-    x0_1 = conv_block(UpSampling2D()(x1_0), 32)
-    x1_1 = conv_block(UpSampling2D()(x2_0), 64)
-    x2_1 = conv_block(UpSampling2D()(x3_0), 128)
-    x3_1 = conv_block(UpSampling2D()(x4_0), 256)
+    x0_1 = conv_block(concatenate([x0_0, UpSampling2D()(x1_0)]), 32)
+    x1_1 = conv_block(concatenate([x1_0, UpSampling2D()(x2_0)]), 64)
+    x2_1 = conv_block(concatenate([x2_0, UpSampling2D()(x3_0)]), 128)
+    #Ax3_1 = conv_block(concatenate([x3_0, UpSampling2D()(x4_0)]), 256)
+    x3_1 = conv_block(attention_gate(x3_0, UpSampling2D()(x4_0),256), 256)
+    
+    x0_2 = conv_block(concatenate([x0_1, UpSampling2D()(x1_1)]), 32)
+    x1_2 = conv_block(concatenate([x1_1, UpSampling2D()(x2_1)]), 64)
+    #Ax2_2 = conv_block(concatenate([x2_1, UpSampling2D()(x3_1)]), 128)
+    x2_2 = conv_block(attention_gate(concatenate([x2_1,x2_0]),UpSampling2D()(x3_1),128), 128)
+    
+    x0_3 = conv_block(concatenate([x0_2, UpSampling2D()(x1_2)]), 32)
+    #Ax1_3 = conv_block(concatenate([x1_2, UpSampling2D()(x2_2)]), 64)
+    x1_3 = conv_block(attention_gate(concatenate([x1_0,x1_1,x1_2]),UpSampling2D()(x2_2),64), 64)   
 
-    x0_2 = conv_block(concatenate([x0_0, attention_gate(x0_1, x0_0, 32)]), 32)
-    x1_2 = conv_block(concatenate([x1_0, attention_gate(x1_1, x1_0, 64)]), 64)
-    x2_2 = conv_block(concatenate([x2_0, attention_gate(x2_1, x2_0, 128)]), 128)
-
-    x0_3 = conv_block(concatenate([x0_0, x0_1, attention_gate(x0_2, x0_0, 32)]), 32)
-    x1_3 = conv_block(concatenate([x1_0, x1_1, attention_gate(x1_2, x1_0, 64)]), 64)
-
-    x0_4 = conv_block(concatenate([x0_0, x0_1, x0_2, attention_gate(x0_3, x0_0, 32)]), 32)
+    x0_4 = conv_block(attention_gate(concatenate([x0_0,x0_1,x0_2,x0_3]),UpSampling2D()(x1_3),32), 32)
 
     # Final output
     outputs = Conv2D(1, (1, 1), activation='sigmoid')(x0_4)
@@ -149,12 +154,20 @@ def build_attention_unet(input_shape=(256, 256, 1)):
     model = Model(inputs=[inputs], outputs=[outputs])
     return model
 
-
+# Create the model
 model = build_attention_unet()
-model.compile(optimizer='adam', loss=dice_loss, metrics=['accuracy',dice_coef,iou_coef,matthews_correlation_coefficient])
+optimizer = Adam(learning_rate=0.001) 
+model.compile(optimizer=optimizer, loss=dice_loss, metrics=['accuracy',dice_coef,iou_coef])
 model.summary()
 
-history=model.fit(images, labels, epochs=60, batch_size=32, validation_data=(images_val,labels_val))
+filepath = "model.keras"
+
+earlystopper = EarlyStopping(patience=10, verbose=1)
+
+checkpoint = ModelCheckpoint(filepath, monitor='val_loss', verbose=1, 
+                             save_best_only=True, mode='min')
+callbacks_list = [earlystopper, checkpoint]
+history=model.fit(images, labels, epochs=60, batch_size=16, validation_data=(images_val,labels_val),callbacks=callbacks_list)
 # Save the model weights
 model.save_weights('model_weights.weights.h5')
 
